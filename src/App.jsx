@@ -81,6 +81,33 @@ async function enrichByCDX(domain) {
   return { firstYear, lastYear, years, totalSnapshots };
 }
 
+// Semaphore/Concurrency helper
+function limitedMap(arr, limit, fn) {
+  let idx = 0;
+  let running = 0;
+  let results = [];
+  return new Promise((resolve, reject) => {
+    function next() {
+      if (idx === arr.length && running === 0) {
+        resolve(results);
+        return;
+      }
+      while (running < limit && idx < arr.length) {
+        const i = idx++;
+        running++;
+        fn(arr[i], i)
+          .then(result => { results[i] = result; })
+          .catch(err => { results[i] = undefined; })
+          .finally(() => {
+            running--;
+            next();
+          });
+      }
+    }
+    next();
+  });
+}
+
 export default function App() {
   const [raw, setRaw] = useState("");
   const domains = useMemo(() => extractDomainsFromText(raw), [raw]);
@@ -92,8 +119,10 @@ export default function App() {
   const abortRef = useRef(null);
 
   const BATCH_SIZE = 10; // Số domain xử lý đồng thời mỗi batch
-  const BATCH_PAUSE_MS = 600; // Nghỉ giữa các batch
+  const BATCH_PAUSE_MS = 500; // Nghỉ giữa các batch
+  const ENRICH_CONCURRENCY = 3; // Số domain enrich song song
 
+  // SCAN: chỉ enrichByCDX cho domain có snapshot
   const startScan = async () => {
     if (domains.length === 0) return;
     setIsScanning(true);
@@ -134,11 +163,12 @@ export default function App() {
               return c;
             });
 
+            // Chỉ enrichByCDX nếu có snapshot
             let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
-            try {
-              enrichInfo = await enrichByCDX(domain);
-            } catch (err) {
-              // Có thể bị rate limit, bỏ qua enrich
+            if (res.archived) {
+              try {
+                enrichInfo = await enrichByCDX(domain);
+              } catch (err) { /* ignore enrich error */ }
             }
             setRows(prev => {
               const c = [...prev];
@@ -198,7 +228,7 @@ export default function App() {
 
   const enrichOne = async (idx) => {
     const r = rows[idx];
-    if (!r || r.status !== "complete") return;
+    if (!r || r.status !== "complete" || r.years !== "—") return;
     try {
       const info = await enrichByCDX(r.domain);
       setRows(prev => {
@@ -206,18 +236,19 @@ export default function App() {
         c[idx] = { ...c[idx], ...info };
         return c;
       });
-    } catch {
-      // bỏ qua enrich lỗi
-    }
+    } catch {/* ignore */}
   };
 
+  // Enrich all (safe) với giới hạn ENRICH_CONCURRENCY luồng đồng thời
   const enrichAllSafe = async () => {
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i]?.status === "complete") {
-        await enrichOne(i);
-        await new Promise(r => setTimeout(r, 150));
-      }
-    }
+    const toEnrich = rows
+      .map((r, i) => ({ ...r, idx: i }))
+      .filter(r => r.status === "complete" && r.years === "—");
+    await limitedMap(
+      toEnrich,
+      ENRICH_CONCURRENCY,
+      async (row) => enrichOne(row.idx)
+    );
   };
 
   const parsedCount = domains.length;
@@ -380,7 +411,7 @@ export default function App() {
                             )}
                             <button
                               onClick={() => enrichOne(i)}
-                              disabled={r.status !== "complete"}
+                              disabled={r.status !== "complete" || r.years !== "—"}
                               className="inline-flex items-center gap-1 px-3 py-1.5 border rounded-md hover:bg-gray-50 disabled:opacity-50"
                             >
                               <Database size={14}/> Enrich
