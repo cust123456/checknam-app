@@ -123,6 +123,13 @@ export default function App() {
           const globalIdx = b * BATCH_SIZE + j;
           try {
             const res = await checkAvailable(domain);
+
+            // Tự động enrichByCDX sau khi checkAvailable thành công
+            let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
+            try {
+              enrichInfo = await enrichByCDX(domain);
+            } catch { /* bỏ qua enrich lỗi */ }
+
             totalTime += res.timeMs;
             setRows(prev => {
               const c = [...prev];
@@ -133,6 +140,7 @@ export default function App() {
                 timeMs: res.timeMs,
                 closestUrl: res.closestUrl,
                 closestTs: res.closestTs,
+                ...enrichInfo
               };
               return c;
             });
@@ -349,7 +357,13 @@ export default function App() {
                             <span className="inline-flex items-center gap-1 text-emerald-700"><CheckCircle2 size={16}/> Complete</span>
                           )}
                         </td>
-                        <td className="px-4 py-2">{r.years ?? "—"}</td>
+                        <td className="px-4 py-2">
+                          {typeof r.years === "string" && /^\d+/.test(r.years) ? (
+                            <span className={r.years.startsWith("0") ? "text-red-500 font-semibold" : "text-green-600 font-semibold"}>
+                              {r.years}
+                            </span>
+                          ) : (r.years ?? "—")}
+                        </td>
                         <td className="px-4 py-2">{r.firstYear ?? "—"}</td>
                         <td className="px-4 py-2">{r.lastYear ?? "—"}</td>
                         <td className="px-4 py-2">{r.totalSnapshots ?? 0}</td>
