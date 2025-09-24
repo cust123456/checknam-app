@@ -1,7 +1,7 @@
 import React, { useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Zap, Download, Loader2, Upload, X, CheckCircle2, AlertCircle, ExternalLink, Database
+  Zap, Download, Loader2, Upload, X, CheckCircle2, AlertCircle, ExternalLink
 } from "lucide-react";
 
 // Lọc domain hợp lệ
@@ -32,10 +32,15 @@ function chunk(arr, size) {
 async function checkAvailable(domain) {
   const endpoint = `https://archive.org/wayback/available?url=${encodeURIComponent(domain)}`;
   const t0 = performance.now();
-  const res = await fetch(endpoint, { cache: "no-store" });
+  let res, data;
+  try {
+    res = await fetch(endpoint, { cache: "no-store" });
+    data = await res.json();
+  } catch (e) {
+    throw new Error("Network error");
+  }
   const t1 = performance.now();
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
   const closest = data?.archived_snapshots?.closest;
   return {
     archived: Boolean(closest),
@@ -48,9 +53,9 @@ async function checkAvailable(domain) {
 async function enrichByCDX(domain) {
   const fetchProxy = async (type) => {
     const url = `/api/cdx?url=${encodeURIComponent(domain)}&type=${type}`;
-    const res = await fetch(url);
-    if (!res.ok) return null;
     try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
       return await res.json();
     } catch {
       return null;
@@ -80,25 +85,48 @@ async function enrichByCDX(domain) {
   return { firstYear, lastYear, years, totalSnapshots };
 }
 
-// Hàm này sẽ thử 2 lần cho 1 domain, lấy kết quả đầu tiên hợp lệ
+// Thử 2 lần cho 1 domain, lấy kết quả đầu tiên hợp lệ, trả về error nếu cả 2 lần đều fail
 async function checkDomainTwice(domain, delayMs = 2500) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const res = await checkAvailable(domain);
       if (res.archived) {
-        // enrichByCDX chỉ khi có snapshot
         let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
         try {
           enrichInfo = await enrichByCDX(domain);
         } catch {}
         return { ...res, ...enrichInfo, status: "complete" };
       }
-    } catch (e) {}
-    // Nếu chưa ra kết quả, chờ delay rồi thử lại lần 2
+      // Nếu không có archived, vẫn trả về complete với snapshot rỗng
+      return { ...res, years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0, status: "complete" };
+    } catch (e) {
+      if (attempt === 2) {
+        return {
+          status: "error",
+          errorMsg: e?.message || "Unknown error",
+          years: "—",
+          firstYear: "—",
+          lastYear: "—",
+          totalSnapshots: 0,
+          timeMs: 0,
+          closestUrl: null,
+          closestTs: null
+        };
+      }
+    }
     if (attempt === 1) await new Promise(r => setTimeout(r, delayMs));
   }
-  // Nếu cả 2 lần đều fail hoặc không có archive
-  return { status: "error", years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0, timeMs: 0, closestUrl: null, closestTs: null };
+  return {
+    status: "error",
+    errorMsg: "Unknown error",
+    years: "—",
+    firstYear: "—",
+    lastYear: "—",
+    totalSnapshots: 0,
+    timeMs: 0,
+    closestUrl: null,
+    closestTs: null
+  };
 }
 
 export default function App() {
@@ -111,6 +139,7 @@ export default function App() {
   const [stats, setStats] = useState({ done: 0, total: 0, errors: 0, avg: 0 });
   const abortRef = useRef(null);
 
+  // Có thể chỉnh nhanh/chậm ở đây
   const BATCH_SIZE = 10; // 10 domain mỗi batch
   const DELAY_BETWEEN_ATTEMPTS = 2500; // 2.5s chờ giữa 2 lần quét 1 domain
   const DELAY_BETWEEN_BATCH = 2500; // 2.5s chờ giữa các batch
@@ -119,7 +148,9 @@ export default function App() {
   const startScan = async () => {
     if (domains.length === 0) return;
     setIsScanning(true);
-    setRows(domains.map(d => ({ domain: d, status: "checking", years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 })));
+    setRows(domains.map(d => ({
+      domain: d, status: "checking", years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0
+    })));
     setStats({ done: 0, total: domains.length, errors: 0, avg: 0 });
 
     const controller = new AbortController();
@@ -141,7 +172,7 @@ export default function App() {
         const globalIdx = b * BATCH_SIZE + j;
         setRows(prev => {
           const c = [...prev];
-          c[globalIdx] = { ...c[globalIdx], status: "checking" };
+          c[globalIdx] = { ...c[globalIdx], status: "checking", errorMsg: undefined };
           return c;
         });
         const t0 = performance.now();
@@ -149,7 +180,11 @@ export default function App() {
         const t1 = performance.now();
         setRows(prev => {
           const c = [...prev];
-          c[globalIdx] = { ...c[globalIdx], ...result, timeMs: Math.max(1, Math.round(t1 - t0)) };
+          c[globalIdx] = {
+            ...c[globalIdx],
+            ...result,
+            timeMs: result.status === "error" ? 0 : Math.max(1, Math.round(t1 - t0))
+          };
           return c;
         });
         done += 1;
@@ -308,13 +343,20 @@ export default function App() {
                         <td className="px-4 py-2 font-mono">{r.domain}</td>
                         <td className="px-4 py-2">
                           {r.status === "checking" && (
-                            <span className="inline-flex items-center gap-1 text-gray-600"><Loader2 className="animate-spin" size={16}/> Checking</span>
+                            <span className="inline-flex items-center gap-1 text-gray-600">
+                              <Loader2 className="animate-spin" size={16}/> Checking
+                            </span>
                           )}
                           {r.status === "error" && (
-                            <span className="inline-flex items-center gap-1 text-red-600"><AlertCircle size={16}/> Error</span>
+                            <span className="inline-flex items-center gap-1 text-red-600">
+                              <AlertCircle size={16}/> Error
+                              {r.errorMsg ? <span className="ml-2 text-xs">{r.errorMsg}</span> : null}
+                            </span>
                           )}
                           {r.status === "complete" && (
-                            <span className="inline-flex items-center gap-1 text-emerald-700"><CheckCircle2 size={16}/> Complete</span>
+                            <span className="inline-flex items-center gap-1 text-emerald-700">
+                              <CheckCircle2 size={16}/> Complete
+                            </span>
                           )}
                         </td>
                         <td className="px-4 py-2">
