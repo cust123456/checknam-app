@@ -1,61 +1,22 @@
 import React, { useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Download, Loader2, Play, Upload, X, CheckCircle2, AlertCircle } from "lucide-react";
+import {
+  Zap, Info, Download, Loader2, Play, Upload, X, CheckCircle2, AlertCircle,
+} from "lucide-react";
 
-// --- Domain utils ---
-function isValidHostname(h) {
-  if (!h) return false;
-  if (h.length > 253) return false;
-  const labels = h.split(".");
-  return labels.every((l) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(l));
+/* ========= Utils ========= */
+function parseDomains(input) {
+  return Array.from(
+    new Set(
+      input
+        .split(/\r?\n|,|\s+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((s) => s.replace(/^(https?:\/\/)?(www\.)?/i, ""))
+    )
+  ).slice(0, 1000);
 }
 
-// Extract unique domains from arbitrary text/URLs/emails
-function extractDomainsFromText(text) {
-  if (!text) return [];
-  const found = new Set();
-
-  // Token pass (handles URLs, emails, plain hostnames)
-  const tokens = text.split(/[\s,;]+/);
-  for (const tokOrig of tokens) {
-    let tok = tokOrig.trim();
-    if (!tok) continue;
-
-    // If it's an email, take the domain part
-    const em = tok.match(/^[^@\s]+@([^@\s]+)$/);
-    if (em) tok = em[1];
-
-    // Strip protocol and leading www.
-    tok = tok.replace(/^[a-z]+:\/\//i, "");
-    tok = tok.replace(/^www\./i, "");
-
-    // Cut off path, port, query, or fragment
-    tok = tok.split(/[\/:?#]/)[0];
-
-    // Trim leading/trailing non-domain characters
-    tok = tok.replace(/^[^a-z0-9]+/gi, "");
-    tok = tok.replace(/[^a-z0-9.-]+$/gi, "");
-
-    tok = tok.toLowerCase().replace(/\.$/, "");
-    if (isValidHostname(tok)) found.add(tok);
-  }
-
-  // Regex pass to catch bare domains inside long blobs
-  const re = /(?:^|[^a-z0-9.-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59}))(?=$|[^a-z0-9.-])/gi;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    let h = (m[1] || "").toLowerCase().replace(/\.$/, "");
-    if (h.startsWith("www.")) h = h.slice(4);
-    if (isValidHostname(h)) found.add(h);
-  }
-
-  return Array.from(found).slice(0, 1000);
-}
-
-// Backward-compat name used elsewhere in the component
-const parseDomains = extractDomainsFromText;
-
-// Wayback check
 async function checkWayback(url) {
   const endpoint = `https://archive.org/wayback/available?url=${encodeURIComponent(url)}`;
   const res = await fetch(endpoint, { cache: "no-store" });
@@ -73,36 +34,21 @@ async function checkWayback(url) {
 
 function formatTs(ts) {
   if (!ts) return "—";
-  const y = ts.slice(0, 4);
-  const m = ts.slice(4, 6);
-  const d = ts.slice(6, 8);
-  const hh = ts.slice(8, 10);
-  const mm = ts.slice(10, 12);
-  const ss = ts.slice(12, 14);
+  const y = ts.slice(0, 4), m = ts.slice(4, 6), d = ts.slice(6, 8);
+  const hh = ts.slice(8, 10), mm = ts.slice(10, 12), ss = ts.slice(12, 14);
   return `${y}-${m}-${d} ${hh}:${mm}:${ss}`;
 }
 
+/* ========= App ========= */
 export default function App() {
   const [input, setInput] = useState("");
-  const [items, setItems] = useState([]);
+  const [items, setItems] = useState([]); // {domain, status, archived, url, timestamp, error}
   const [isRunning, setIsRunning] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
-  const [concurrency, setConcurrency] = useState(10);
   const abortRef = useRef(null);
 
   const domains = useMemo(() => parseDomains(input), [input]);
-
-  const handleInputChange = (e) => {
-    const cleaned = parseDomains(e.target.value);
-    setInput(cleaned.join("\n"));
-  };
-
-  const handlePaste = (e) => {
-    const text = e.clipboardData?.getData("text") || "";
-    const cleaned = parseDomains(text);
-    e.preventDefault();
-    setInput(cleaned.join("\n"));
-  };
+  const donePct = progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
 
   const start = async () => {
     const list = parseDomains(input);
@@ -114,40 +60,43 @@ export default function App() {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    let idx = 0;
+    // chạy theo “batch” 10 domain/lần để giống mô tả UI
+    const BATCH = 10;
     let done = 0;
 
-    const next = async () => {
-      if (controller.signal.aborted) return;
-      if (idx >= list.length) return;
-      const i = idx++;
-      const domain = list[i];
-      try {
-        setItems((prev) => {
-          const copy = [...prev];
-          copy[i] = { ...copy[i], status: "checking" };
-          return copy;
-        });
-        const res = await checkWayback(domain);
-        setItems((prev) => {
-          const copy = [...prev];
-          copy[i] = { domain, ...res };
-          return copy;
-        });
-      } catch (e) {
-        setItems((prev) => {
-          const copy = [...prev];
-          copy[i] = { domain, status: "error", error: String(e) };
-          return copy;
-        });
-      } finally {
-        done += 1;
-        setProgress({ done, total: list.length });
-        if (idx < list.length) await next();
-      }
-    };
+    for (let startIdx = 0; startIdx < list.length; startIdx += BATCH) {
+      if (controller.signal.aborted) break;
+      const batch = list.slice(startIdx, startIdx + BATCH);
 
-    await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, () => next()));
+      await Promise.all(
+        batch.map(async (domain, j) => {
+          const i = startIdx + j;
+          try {
+            setItems((prev) => {
+              const copy = [...prev];
+              copy[i] = { ...copy[i], status: "checking" };
+              return copy;
+            });
+            const res = await checkWayback(domain);
+            setItems((prev) => {
+              const copy = [...prev];
+              copy[i] = { domain, ...res };
+              return copy;
+            });
+          } catch (e) {
+            setItems((prev) => {
+              const copy = [...prev];
+              copy[i] = { domain, status: "error", error: String(e) };
+              return copy;
+            });
+          } finally {
+            done += 1;
+            setProgress({ done, total: list.length });
+          }
+        })
+      );
+    }
+
     setIsRunning(false);
   };
 
@@ -158,22 +107,10 @@ export default function App() {
 
   const loadSamples = () => {
     const samples = [
-      "https://openai.com/blog",
-      "example.com",
-      "wikipedia.org/wiki/React_(web_framework)",
-      "https://github.com/vitejs/vite",
-      "mailto:abc@nytimes.com",
-      "cnn.com/some/path?x=1",
-      "web.archive.org",
-      "nonexistent-domain-abc-xyz-123.tld",
+      "example.com","example.org","example.net","google.com","facebook.com",
+      "github.com","stackoverflow.com","reddit.com","wikipedia.org","youtube.com",
     ];
-    setInput(parseDomains(samples.join("\n")).join("\n"));
-  };
-
-  const clearAll = () => {
-    setInput("");
-    setItems([]);
-    setProgress({ done: 0, total: 0 });
+    setInput(samples.join("\n"));
   };
 
   const exportCSV = () => {
@@ -185,7 +122,9 @@ export default function App() {
       it.timestamp || "",
       it.url || "",
     ]);
-    const csv = [header, ...rows].map((r) => r.map((x) => `"${String(x || "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    const csv = [header, ...rows]
+      .map((r) => r.map((x) => `"${String(x || "").replace(/"/g, '""')}"`).join(","))
+      .join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
@@ -193,119 +132,158 @@ export default function App() {
     a.click();
   };
 
-  const donePct = progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
-
   return (
-    <div className="min-h-screen bg-neutral-50 text-neutral-900 p-6">
-      <div className="max-w-6xl mx-auto space-y-6">
-        <header className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl md:text-3xl font-bold">High-Speed Archive Checker</h1>
-            <p className="text-sm md:text-base text-neutral-600">
-              Ultra-fast domain archive checking tool. Up to 1000 domains • {concurrency} concurrent checks • Parallel, reliable.
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
+      <div className="container mx-auto px-4 py-8">
+        {/* Header */}
+        <div className="text-center mb-8">
+          <h1 className="text-4xl font-bold text-gray-900 mb-4 flex items-center justify-center gap-3">
+            <Zap className="w-10 h-10 text-yellow-500" />
+            High-Speed Archive Checker
+          </h1>
+          <p className="text-xl text-gray-600 max-w-3xl mx-auto">
+            Ultra-fast domain archive checking tool. Process up to 1000 domains with 10 domains per batch and parallel processing for maximum speed.
+          </p>
+        </div>
+
+        {/* Card */}
+        <div className="rounded-lg border bg-white text-gray-900 shadow-sm max-w-6xl mx-auto">
+          <div className="flex flex-col space-y-1.5 p-6">
+            <h3 className="tracking-tight text-2xl font-semibold flex items-center">
+              {/* Chart icon-looking title */}
+              <svg xmlns="http://www.w3.org/2000/svg" className="w-6 h-6 mr-3 text-blue-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M3 3v16a2 2 0 0 0 2 2h16" />
+                <path d="M18 17V9" />
+                <path d="M13 17V5" />
+                <path d="M8 17v-3" />
+              </svg>
+              Quick Bulk Archive Check
+            </h3>
+            <p className="text-gray-500 text-lg">
+              High-performance scanning: 10 domains per batch • Parallel processing • Production optimized • Error-handled
             </p>
           </div>
-          <div className="flex gap-2">
-            <button onClick={loadSamples} className="px-3 py-2 rounded-2xl border shadow-sm hover:shadow transition flex items-center gap-2">
-              <Upload size={16}/>Load samples
-            </button>
-            {isRunning ? (
-              <button onClick={stop} className="px-3 py-2 rounded-2xl border shadow-sm bg-red-50 hover:bg-red-100 transition flex items-center gap-2">
-                <X size={16}/>Stop
-              </button>
-            ) : (
-              <button onClick={start} className="px-3 py-2 rounded-2xl border shadow-sm bg-emerald-50 hover:bg-emerald-100 transition flex items-center gap-2">
-                <Play size={16}/>Start
-              </button>
-            )}
-          </div>
-        </header>
 
-        <section className="grid md:grid-cols-2 gap-6">
-          <div className="space-y-3">
-            <label className="text-sm font-medium">Domains (1 per line, max 1000)</label>
+          <div className="p-6 pt-6 space-y-6">
+            {/* Info banner */}
+            <div className="flex items-center gap-2 text-sm text-blue-700 bg-blue-50 p-3 rounded-lg">
+              <Info className="h-4 w-4 text-blue-600" />
+              <p>
+                <strong>High-Speed Mode:</strong> Enter up to 1000 domains. Optimized for production deployment with robust error handling.
+              </p>
+            </div>
+
+            {/* Textarea */}
             <textarea
-              className="w-full h-56 md:h-72 p-3 rounded-2xl border shadow-sm focus:outline-none focus:ring-2"
-              placeholder={"Paste anything: URLs, emails, text…\nI will keep only unique valid domains."}
+              className="flex w-full rounded-md border border-gray-200 bg-white px-3 py-2 placeholder:text-gray-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 min-h-[250px] text-sm font-mono"
+              placeholder="Enter domains (one per line or comma-separated)&#10;Examples: example.com example.org example.net google.com github.com wikipedia.org"
               value={input}
-              onChange={handleInputChange}
-              onPaste={handlePaste}
+              onChange={(e) => setInput(e.target.value)}
             />
-            <div className="flex flex-wrap items-center gap-3 text-sm">
-              <div className="flex items-center gap-2">
-                <span>Concurrency</span>
-                <input type="range" min={1} max={20} value={concurrency} onChange={(e) => setConcurrency(Number(e.target.value))} />
-                <span className="font-medium w-6 text-center">{concurrency}</span>
+
+            {/* Buttons */}
+            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+              <div className="flex items-center gap-3">
+                {isRunning ? (
+                  <button
+                    onClick={stop}
+                    className="inline-flex items-center justify-center h-11 rounded-md bg-red-600 hover:bg-red-700 text-white px-6 py-3 text-lg"
+                  >
+                    <X className="mr-2 h-5 w-5" />
+                    Stop
+                  </button>
+                ) : (
+                  <button
+                    onClick={start}
+                    disabled={domains.length === 0}
+                    className="inline-flex items-center justify-center h-11 rounded-md bg-yellow-600 hover:bg-yellow-700 disabled:opacity-60 text-white px-6 py-3 text-lg"
+                  >
+                    <Play className="mr-2 h-5 w-5" />
+                    Start High-Speed Scan
+                  </button>
+                )}
               </div>
-              <span className="text-neutral-500">Parsed: {domains.length}</span>
-              <button onClick={clearAll} className="text-neutral-700 underline">Clear</button>
-              <button onClick={exportCSV} className="flex items-center gap-2 underline"><Download size={16}/>Export CSV</button>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={loadSamples}
+                  className="inline-flex items-center justify-center border border-gray-200 bg-white hover:bg-gray-50 h-10 px-4 rounded-md text-sm"
+                >
+                  <Upload className="mr-2 h-4 w-4" />
+                  Load Sample Domains
+                </button>
+                <button
+                  onClick={exportCSV}
+                  className="inline-flex items-center justify-center border border-gray-200 bg-white hover:bg-gray-50 h-10 px-4 rounded-md text-sm"
+                >
+                  <Download className="mr-2 h-4 w-4" />
+                  Export CSV
+                </button>
+              </div>
             </div>
 
-            <div className="mt-2">
-              <div className="h-3 bg-neutral-200 rounded-full overflow-hidden">
-                <div className="h-full bg-black" style={{ width: `${donePct}%` }} />
+            {/* Progress bar */}
+            {progress.total > 0 && (
+              <div className="space-y-1">
+                <div className="h-3 bg-gray-200 rounded-full overflow-hidden">
+                  <div className="h-full bg-gray-900" style={{ width: `${donePct}%` }} />
+                </div>
+                <div className="text-xs text-gray-500">{progress.done} / {progress.total} • {donePct}%</div>
               </div>
-              <div className="text-xs text-neutral-600 mt-1">{progress.done} / {progress.total} • {donePct}%</div>
-            </div>
+            )}
+
+            {/* Results */}
+            {items.length > 0 && (
+              <div className="rounded-lg border bg-white overflow-hidden">
+                <div className="grid grid-cols-6 gap-2 p-3 text-xs font-medium bg-gray-50 border-b">
+                  <div className="col-span-2">Domain</div>
+                  <div>Archived</div>
+                  <div>Timestamp</div>
+                  <div className="col-span-2">Archive URL</div>
+                </div>
+                <div className="max-h-[420px] overflow-auto divide-y">
+                  <AnimatePresence initial={false}>
+                    {items.map((it) => (
+                      <motion.div
+                        key={it.domain}
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        className="grid grid-cols-6 gap-2 p-3 text-sm items-center"
+                      >
+                        <div className="col-span-2 font-mono truncate" title={it.domain}>{it.domain}</div>
+                        <div>
+                          {it.status === "checking" && (
+                            <span className="inline-flex items-center gap-1"><Loader2 className="animate-spin" size={16}/> checking</span>
+                          )}
+                          {it.status === "queued" && <span>queued</span>}
+                          {it.status === "error" && (
+                            <span className="inline-flex items-center gap-1 text-red-600">
+                              <AlertCircle size={16}/> error
+                            </span>
+                          )}
+                          {(!it.status || it.status === "archived" || it.status === "not_found") && (
+                            <span className={it.archived ? "inline-flex items-center gap-1 text-emerald-700" : "inline-flex items-center gap-1 text-gray-500"}>
+                              {it.archived ? <CheckCircle2 size={16}/> : <AlertCircle size={16}/>}
+                              {it.archived ? "yes" : "no"}
+                            </span>
+                          )}
+                        </div>
+                        <div className="font-mono text-xs">{formatTs(it.timestamp)}</div>
+                        <div className="col-span-2 truncate">
+                          {it.url ? (
+                            <a className="underline" href={it.url} target="_blank" rel="noreferrer">{it.url}</a>
+                          ) : <span className="text-gray-400">—</span>}
+                        </div>
+                      </motion.div>
+                    ))}
+                  </AnimatePresence>
+                </div>
+              </div>
+            )}
+
           </div>
-
-          <div className="space-y-2">
-            <div className="flex items-center gap-2 text-sm text-neutral-600">
-              <span>Status legend:</span>
-              <span className="flex items-center gap-1"><CheckCircle2 size={16}/> archived</span>
-              <span className="flex items-center gap-1"><AlertCircle size={16}/> not found / error</span>
-            </div>
-            <div className="rounded-2xl border bg-white shadow-sm overflow-hidden">
-              <div className="grid grid-cols-6 gap-2 p-3 text-xs font-medium bg-neutral-50 border-b">
-                <div className="col-span-2">Domain</div>
-                <div>Archived</div>
-                <div>Timestamp</div>
-                <div className="col-span-2">Archive URL</div>
-              </div>
-              <div className="max-h-[460px] overflow-auto divide-y">
-                <AnimatePresence initial={false}>
-                  {items.map((it) => (
-                    <motion.div
-                      key={it.domain}
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      exit={{ opacity: 0 }}
-                      className="grid grid-cols-6 gap-2 p-3 text-sm items-center"
-                    >
-                      <div className="col-span-2 font-mono truncate" title={it.domain}>{it.domain}</div>
-                      <div>
-                        {it.status === "checking" && (
-                          <span className="inline-flex items-center gap-1"><Loader2 className="animate-spin" size={16}/> checking</span>
-                        )}
-                        {it.status === "queued" && <span>queued</span>}
-                        {it.status === "error" && <span className="inline-flex items-center gap-1 text-red-600"><AlertCircle size={16}/> error</span>}
-                        {(!it.status || it.status === "archived" || it.status === "not_found") && (
-                          <span className={it.archived ? "inline-flex items-center gap-1 text-emerald-700" : "inline-flex items-center gap-1 text-neutral-500"}>
-                            {it.archived ? <CheckCircle2 size={16}/> : <AlertCircle size={16}/>}
-                            {it.archived ? "yes" : "no"}
-                          </span>
-                        )}
-                      </div>
-                      <div className="font-mono text-xs">{formatTs(it.timestamp)}</div>
-                      <div className="col-span-2 truncate">
-                        {it.url ? (
-                          <a className="underline" href={it.url} target="_blank" rel="noreferrer">{it.url}</a>
-                        ) : (
-                          <span className="text-neutral-400">—</span>
-                        )}
-                      </div>
-                    </motion.div>
-                  ))}
-                </AnimatePresence>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <footer className="text-xs text-neutral-500 pt-4">
-          Built with React • Tailwind • Framer Motion • Uses public Wayback API (archive.org/wayback/available)
-        </footer>
+        </div>
       </div>
     </div>
   );
