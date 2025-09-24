@@ -45,14 +45,13 @@ async function checkAvailable(domain) {
   };
 }
 
-// CDX: lấy first/last/năm-span + tổng snapshot theo NĂM (nhẹ) qua proxy
+// CDX: lấy first/last/năm-span + tổng snapshot theo NĂM (nhẹ) qua serverless function /api/cdx
 async function enrichByCDX(domain) {
-  // nhỏ giọt để tránh bị chặn
   await new Promise(r => setTimeout(r, 120));
 
-  // Gọi qua proxy
+  // Gọi qua API route trên Vercel
   const fetchProxy = async (type) => {
-    const url = `http://localhost:3001/cdx?url=${encodeURIComponent(domain)}&type=${type}`;
+    const url = `/api/cdx?url=${encodeURIComponent(domain)}&type=${type}`;
     const res = await fetch(url);
     if (!res.ok) return null;
     try {
