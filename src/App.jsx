@@ -4,7 +4,7 @@ import {
   Zap, Download, Loader2, Upload, X, CheckCircle2, AlertCircle, ExternalLink, Database
 } from "lucide-react";
 
-// Lọc “bẩn” -> domain hợp lệ
+// Lọc domain hợp lệ
 function extractDomainsFromText(input) {
   if (!input) return [];
   const rough = input.split(/\r?\n|,|\s+/).map(s => s.trim()).filter(Boolean);
@@ -28,7 +28,7 @@ function chunk(arr, size) {
   return out;
 }
 
-// Wayback Available API (ổn định, nhanh)
+// Wayback Available API
 async function checkAvailable(domain) {
   const endpoint = `https://archive.org/wayback/available?url=${encodeURIComponent(domain)}`;
   const t0 = performance.now();
@@ -45,11 +45,8 @@ async function checkAvailable(domain) {
   };
 }
 
-// CDX: lấy first/last/năm-span + tổng snapshot theo NĂM (nhẹ) qua serverless function /api/cdx
+// Gọi CDX proxy qua API route Vercel
 async function enrichByCDX(domain) {
-  await new Promise(r => setTimeout(r, 120));
-
-  // Gọi qua API route trên Vercel
   const fetchProxy = async (type) => {
     const url = `/api/cdx?url=${encodeURIComponent(domain)}&type=${type}`;
     const res = await fetch(url);
@@ -94,7 +91,8 @@ export default function App() {
   const [stats, setStats] = useState({ done: 0, total: 0, errors: 0, avg: 0 });
   const abortRef = useRef(null);
 
-  const BATCH_SIZE = 10;
+  const BATCH_SIZE = 10; // Số domain xử lý đồng thời mỗi batch
+  const BATCH_PAUSE_MS = 600; // Nghỉ giữa các batch
 
   const startScan = async () => {
     if (domains.length === 0) return;
@@ -116,52 +114,54 @@ export default function App() {
       setBatchInfo({ idx: b + 1, total: batches.length });
       const batch = batches[b];
 
-      for (let j = 0; j < batch.length; j++) {
-        if (controller.signal.aborted) continue;
-        const domain = batch[j];
-        const globalIdx = b * BATCH_SIZE + j;
-        try {
-          const res = await checkAvailable(domain);
-          setRows(prev => {
-            const c = [...prev];
-            c[globalIdx] = {
-              ...c[globalIdx],
-              domain,
-              status: "complete",
-              timeMs: res.timeMs,
-              closestUrl: res.closestUrl,
-              closestTs: res.closestTs,
-            };
-            return c;
-          });
-
-          let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
+      // Song song trong batch
+      await Promise.all(
+        batch.map(async (domain, j) => {
+          if (controller.signal.aborted) return;
+          const globalIdx = b * BATCH_SIZE + j;
           try {
-            enrichInfo = await enrichByCDX(domain);
-            await new Promise(r => setTimeout(r, 150));
-          } catch (err) {
-            console.error("enrichByCDX failed for", domain, err);
-          }
-          setRows(prev => {
-            const c = [...prev];
-            c[globalIdx] = { ...c[globalIdx], ...enrichInfo };
-            return c;
-          });
+            const res = await checkAvailable(domain);
+            setRows(prev => {
+              const c = [...prev];
+              c[globalIdx] = {
+                ...c[globalIdx],
+                domain,
+                status: "complete",
+                timeMs: res.timeMs,
+                closestUrl: res.closestUrl,
+                closestTs: res.closestTs,
+              };
+              return c;
+            });
 
-          totalTime += res.timeMs;
-        } catch (e) {
-          errors += 1;
-          setRows(prev => {
-            const c = [...prev];
-            c[globalIdx] = { ...c[globalIdx], domain, status: "error", timeMs: 0, closestUrl: null, closestTs: null };
-            return c;
-          });
-        } finally {
-          done += 1;
-          setStats({ done, total: domains.length, errors, avg: Math.round(totalTime / Math.max(1, (done - errors))) });
-        }
-      }
+            let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
+            try {
+              enrichInfo = await enrichByCDX(domain);
+            } catch (err) {
+              // Có thể bị rate limit, bỏ qua enrich
+            }
+            setRows(prev => {
+              const c = [...prev];
+              c[globalIdx] = { ...c[globalIdx], ...enrichInfo };
+              return c;
+            });
+
+            totalTime += res.timeMs;
+          } catch (e) {
+            errors += 1;
+            setRows(prev => {
+              const c = [...prev];
+              c[globalIdx] = { ...c[globalIdx], domain, status: "error", timeMs: 0, closestUrl: null, closestTs: null };
+              return c;
+            });
+          } finally {
+            done += 1;
+            setStats({ done, total: domains.length, errors, avg: Math.round(totalTime / Math.max(1, (done - errors))) });
+          }
+        })
+      );
       if (controller.signal.aborted) break;
+      await new Promise(r => setTimeout(r, BATCH_PAUSE_MS));
     }
 
     setIsScanning(false);
@@ -207,7 +207,7 @@ export default function App() {
         return c;
       });
     } catch {
-      // bỏ qua
+      // bỏ qua enrich lỗi
     }
   };
 
