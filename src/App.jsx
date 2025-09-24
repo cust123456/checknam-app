@@ -45,7 +45,6 @@ async function checkAvailable(domain) {
   };
 }
 
-// Gọi CDX proxy qua API route Vercel
 async function enrichByCDX(domain) {
   const fetchProxy = async (type) => {
     const url = `/api/cdx?url=${encodeURIComponent(domain)}&type=${type}`;
@@ -81,31 +80,25 @@ async function enrichByCDX(domain) {
   return { firstYear, lastYear, years, totalSnapshots };
 }
 
-// Semaphore/Concurrency helper
-function limitedMap(arr, limit, fn) {
-  let idx = 0;
-  let running = 0;
-  let results = [];
-  return new Promise((resolve, reject) => {
-    function next() {
-      if (idx === arr.length && running === 0) {
-        resolve(results);
-        return;
+// Hàm này sẽ thử 2 lần cho 1 domain, lấy kết quả đầu tiên hợp lệ
+async function checkDomainTwice(domain, delayMs = 2500) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await checkAvailable(domain);
+      if (res.archived) {
+        // enrichByCDX chỉ khi có snapshot
+        let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
+        try {
+          enrichInfo = await enrichByCDX(domain);
+        } catch {}
+        return { ...res, ...enrichInfo, status: "complete" };
       }
-      while (running < limit && idx < arr.length) {
-        const i = idx++;
-        running++;
-        fn(arr[i], i)
-          .then(result => { results[i] = result; })
-          .catch(err => { results[i] = undefined; })
-          .finally(() => {
-            running--;
-            next();
-          });
-      }
-    }
-    next();
-  });
+    } catch (e) {}
+    // Nếu chưa ra kết quả, chờ delay rồi thử lại lần 2
+    if (attempt === 1) await new Promise(r => setTimeout(r, delayMs));
+  }
+  // Nếu cả 2 lần đều fail hoặc không có archive
+  return { status: "error", years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0, timeMs: 0, closestUrl: null, closestTs: null };
 }
 
 export default function App() {
@@ -118,11 +111,11 @@ export default function App() {
   const [stats, setStats] = useState({ done: 0, total: 0, errors: 0, avg: 0 });
   const abortRef = useRef(null);
 
-  const BATCH_SIZE = 10; // Số domain xử lý đồng thời mỗi batch
-  const BATCH_PAUSE_MS = 500; // Nghỉ giữa các batch
-  const ENRICH_CONCURRENCY = 3; // Số domain enrich song song
+  const BATCH_SIZE = 10; // 10 domain mỗi batch
+  const DELAY_BETWEEN_ATTEMPTS = 2500; // 2.5s chờ giữa 2 lần quét 1 domain
+  const DELAY_BETWEEN_BATCH = 2500; // 2.5s chờ giữa các batch
 
-  // SCAN: chỉ enrichByCDX cho domain có snapshot
+  // Chạy từng batch, từng domain quét 2 lần, tuần tự batch
   const startScan = async () => {
     if (domains.length === 0) return;
     setIsScanning(true);
@@ -136,62 +129,36 @@ export default function App() {
     setBatchInfo({ idx: 1, total: batches.length });
 
     let done = 0;
-    let totalTime = 0;
     let errors = 0;
+    let totalTime = 0;
 
     for (let b = 0; b < batches.length; b++) {
       setBatchInfo({ idx: b + 1, total: batches.length });
       const batch = batches[b];
-
-      // Song song trong batch
-      await Promise.all(
-        batch.map(async (domain, j) => {
-          if (controller.signal.aborted) return;
-          const globalIdx = b * BATCH_SIZE + j;
-          try {
-            const res = await checkAvailable(domain);
-            setRows(prev => {
-              const c = [...prev];
-              c[globalIdx] = {
-                ...c[globalIdx],
-                domain,
-                status: "complete",
-                timeMs: res.timeMs,
-                closestUrl: res.closestUrl,
-                closestTs: res.closestTs,
-              };
-              return c;
-            });
-
-            // Chỉ enrichByCDX nếu có snapshot
-            let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
-            if (res.archived) {
-              try {
-                enrichInfo = await enrichByCDX(domain);
-              } catch (err) { /* ignore enrich error */ }
-            }
-            setRows(prev => {
-              const c = [...prev];
-              c[globalIdx] = { ...c[globalIdx], ...enrichInfo };
-              return c;
-            });
-
-            totalTime += res.timeMs;
-          } catch (e) {
-            errors += 1;
-            setRows(prev => {
-              const c = [...prev];
-              c[globalIdx] = { ...c[globalIdx], domain, status: "error", timeMs: 0, closestUrl: null, closestTs: null };
-              return c;
-            });
-          } finally {
-            done += 1;
-            setStats({ done, total: domains.length, errors, avg: Math.round(totalTime / Math.max(1, (done - errors))) });
-          }
-        })
-      );
+      for (let j = 0; j < batch.length; j++) {
+        if (controller.signal.aborted) continue;
+        const domain = batch[j];
+        const globalIdx = b * BATCH_SIZE + j;
+        setRows(prev => {
+          const c = [...prev];
+          c[globalIdx] = { ...c[globalIdx], status: "checking" };
+          return c;
+        });
+        const t0 = performance.now();
+        const result = await checkDomainTwice(domain, DELAY_BETWEEN_ATTEMPTS);
+        const t1 = performance.now();
+        setRows(prev => {
+          const c = [...prev];
+          c[globalIdx] = { ...c[globalIdx], ...result, timeMs: Math.max(1, Math.round(t1 - t0)) };
+          return c;
+        });
+        done += 1;
+        if (result.status === "error") errors += 1;
+        else totalTime += (result.timeMs || 0);
+        setStats({ done, total: domains.length, errors, avg: Math.round(totalTime / Math.max(1, (done - errors))) });
+      }
       if (controller.signal.aborted) break;
-      await new Promise(r => setTimeout(r, BATCH_PAUSE_MS));
+      if (b < batches.length - 1) await new Promise(r => setTimeout(r, DELAY_BETWEEN_BATCH));
     }
 
     setIsScanning(false);
@@ -226,38 +193,12 @@ export default function App() {
     a.click();
   };
 
-  const enrichOne = async (idx) => {
-    const r = rows[idx];
-    if (!r || r.status !== "complete" || r.years !== "—") return;
-    try {
-      const info = await enrichByCDX(r.domain);
-      setRows(prev => {
-        const c = [...prev];
-        c[idx] = { ...c[idx], ...info };
-        return c;
-      });
-    } catch {/* ignore */}
-  };
-
-  // Enrich all (safe) với giới hạn ENRICH_CONCURRENCY luồng đồng thời
-  const enrichAllSafe = async () => {
-    const toEnrich = rows
-      .map((r, i) => ({ ...r, idx: i }))
-      .filter(r => r.status === "complete" && r.years === "—");
-    await limitedMap(
-      toEnrich,
-      ENRICH_CONCURRENCY,
-      async (row) => enrichOne(row.idx)
-    );
-  };
-
   const parsedCount = domains.length;
   const pct = stats.total ? Math.round((stats.done / stats.total) * 100) : 0;
 
   return (
     <div className="min-h-screen bg-[#EEF2FF]">
       <div className="max-w-6xl mx-auto px-4 py-6">
-        {/* Controls row */}
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-4">
           <button
             onClick={startScan}
@@ -267,7 +208,6 @@ export default function App() {
             <Zap className="w-5 h-5" />
             {isScanning ? "High-Speed Scanning..." : "High-Speed Scan"}
           </button>
-
           <div className="flex gap-3">
             <button
               onClick={() => {
@@ -295,7 +235,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Batch progress bar */}
         {isScanning && (
           <div className="p-4 border rounded-lg bg-white mb-4">
             <div className="flex items-center gap-2 text-sm">
@@ -303,13 +242,12 @@ export default function App() {
               <span className="font-medium">
                 Processing batch {batchInfo.idx} of {batchInfo.total}
               </span>
-              <span className="text-gray-500">({(stats.done / Math.max(1, stats.total)).toFixed(1)} of 1.0s approx is just placeholder)</span>
             </div>
             <div className="h-2 bg-gray-200 rounded-full overflow-hidden mt-3">
               <div className="h-full bg-black" style={{ width: `${pct}%` }} />
             </div>
             <div className="text-xs text-gray-600 mt-2">
-              10 domains per batch • Parallel processing • High-speed mode
+              10 domains per batch • Each domain checked twice • Batch runs sequentially
             </div>
             <div className="mt-2 text-sm flex items-center gap-4">
               <span className="text-emerald-600">✓ Completed: {stats.done - stats.errors}</span>
@@ -322,7 +260,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Input */}
         <div className="bg-white border rounded-lg p-4 mb-4">
           <textarea
             className="w-full min-h-[160px] rounded-md border border-gray-200 p-3 font-mono text-sm outline-none focus:ring-2 focus:ring-blue-500"
@@ -345,19 +282,11 @@ export default function App() {
           )}
         </div>
 
-        {/* Results */}
         {rows.length > 0 && (
           <div className="bg-white border rounded-lg">
             <div className="px-4 py-3 text-base font-semibold border-b flex items-center justify-between">
               <span>Scan Results ({rows.length} domains)</span>
-              <button
-                onClick={enrichAllSafe}
-                className="inline-flex items-center gap-1 px-3 py-1.5 border rounded-md text-sm hover:bg-gray-50"
-              >
-                <Database size={14} /> Enrich All (safe)
-              </button>
             </div>
-
             <div className="overflow-auto">
               <table className="min-w-full text-sm">
                 <thead className="bg-gray-50 text-gray-700">
@@ -409,13 +338,6 @@ export default function App() {
                             ) : (
                               <span className="text-gray-400 px-3 py-1.5 border rounded-md">Archive</span>
                             )}
-                            <button
-                              onClick={() => enrichOne(i)}
-                              disabled={r.status !== "complete" || r.years !== "—"}
-                              className="inline-flex items-center gap-1 px-3 py-1.5 border rounded-md hover:bg-gray-50 disabled:opacity-50"
-                            >
-                              <Database size={14}/> Enrich
-                            </button>
                           </div>
                         </td>
                       </motion.tr>
@@ -427,7 +349,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Footer */}
         <div className="text-xs text-neutral-500 pt-6">
           Built with React · Tailwind · Framer Motion · Uses Wayback Available + CDX APIs
         </div>
