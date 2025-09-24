@@ -4,7 +4,6 @@ import {
   Zap, Download, Loader2, Upload, X, CheckCircle2, AlertCircle, ExternalLink, Database
 } from "lucide-react";
 
-/* ============== Utils ============== */
 // Lọc “bẩn” -> domain hợp lệ
 function extractDomainsFromText(input) {
   if (!input) return [];
@@ -46,54 +45,56 @@ async function checkAvailable(domain) {
   };
 }
 
-// CDX: lấy first/last/năm-span + tổng snapshot theo NĂM (nhẹ)
+// CDX: lấy first/last/năm-span + tổng snapshot theo NĂM (nhẹ) qua proxy
 async function enrichByCDX(domain) {
   // nhỏ giọt để tránh bị chặn
   await new Promise(r => setTimeout(r, 120));
 
-  const firstLastBase = `https://web.archive.org/cdx/search/cdx?output=json&filter=statuscode:200&fl=timestamp&collapse=digest&url=${encodeURIComponent(domain)}`;
-  const byYearUrl = `https://web.archive.org/cdx/search/cdx?output=json&fl=timestamp&collapse=timestamp:4&filter=statuscode:200&url=${encodeURIComponent(domain)}`;
-
-  const [firstRes, lastRes, yearRes] = await Promise.allSettled([
-    fetch(firstLastBase + "&limit=1&sort=ascending", { cache: "no-store" }),
-    fetch(firstLastBase + "&limit=1&sort=descending", { cache: "no-store" }),
-    fetch(byYearUrl, { cache: "no-store" }),
-  ]);
+  // Gọi qua proxy
+  const fetchProxy = async (type) => {
+    const url = `http://localhost:3001/cdx?url=${encodeURIComponent(domain)}&type=${type}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    try {
+      return await res.json();
+    } catch {
+      return null;
+    }
+  };
 
   let firstYear = "—", lastYear = "—", years = "—", totalSnapshots = 0;
 
-  if (firstRes.status === "fulfilled" && firstRes.value.ok) {
-    const j = await firstRes.value.json();
-    if (Array.isArray(j) && j.length > 1 && j[1][0]) firstYear = j[1][0].slice(0, 4);
+  const firstRes = await fetchProxy("first");
+  if (Array.isArray(firstRes) && firstRes.length > 1 && firstRes[1][0]) {
+    firstYear = firstRes[1][0].slice(0, 4);
   }
-  if (lastRes.status === "fulfilled" && lastRes.value.ok) {
-    const j = await lastRes.value.json();
-    if (Array.isArray(j) && j.length > 1 && j[1][0]) lastYear = j[1][0].slice(0, 4);
+
+  const lastRes = await fetchProxy("last");
+  if (Array.isArray(lastRes) && lastRes.length > 1 && lastRes[1][0]) {
+    lastYear = lastRes[1][0].slice(0, 4);
   }
+
   if (firstYear !== "—" && lastYear !== "—") {
     const span = Number(lastYear) - Number(firstYear);
     years = `${span} years`;
   }
-  if (yearRes.status === "fulfilled" && yearRes.value.ok) {
-    const j = await yearRes.value.json();
-    totalSnapshots = Math.max(0, (Array.isArray(j) ? j.length - 1 : 0));
-  }
+
+  const yearRes = await fetchProxy("year");
+  totalSnapshots = Math.max(0, (Array.isArray(yearRes) ? yearRes.length - 1 : 0));
 
   return { firstYear, lastYear, years, totalSnapshots };
 }
 
-/* ============== App ============== */
 export default function App() {
   const [raw, setRaw] = useState("");
   const domains = useMemo(() => extractDomainsFromText(raw), [raw]);
 
-  const [rows, setRows] = useState([]); // {domain,status,timeMs,closestUrl,closestTs,years,firstYear,lastYear,totalSnapshots}
+  const [rows, setRows] = useState([]);
   const [isScanning, setIsScanning] = useState(false);
   const [batchInfo, setBatchInfo] = useState({ idx: 0, total: 0 });
   const [stats, setStats] = useState({ done: 0, total: 0, errors: 0, avg: 0 });
   const abortRef = useRef(null);
 
-  // cấu hình batch
   const BATCH_SIZE = 10;
 
   const startScan = async () => {
@@ -116,48 +117,51 @@ export default function App() {
       setBatchInfo({ idx: b + 1, total: batches.length });
       const batch = batches[b];
 
-      // chạy song song trong batch (đủ nhanh, số lượng nhỏ)
-      await Promise.all(
-        batch.map(async (domain, j) => {
-          if (controller.signal.aborted) return;
-          const globalIdx = b * BATCH_SIZE + j;
+      for (let j = 0; j < batch.length; j++) {
+        if (controller.signal.aborted) continue;
+        const domain = batch[j];
+        const globalIdx = b * BATCH_SIZE + j;
+        try {
+          const res = await checkAvailable(domain);
+          setRows(prev => {
+            const c = [...prev];
+            c[globalIdx] = {
+              ...c[globalIdx],
+              domain,
+              status: "complete",
+              timeMs: res.timeMs,
+              closestUrl: res.closestUrl,
+              closestTs: res.closestTs,
+            };
+            return c;
+          });
+
+          let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
           try {
-            const res = await checkAvailable(domain);
-
-            // Tự động enrichByCDX sau khi checkAvailable thành công
-            let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
-            try {
-              enrichInfo = await enrichByCDX(domain);
-            } catch { /* bỏ qua enrich lỗi */ }
-
-            totalTime += res.timeMs;
-            setRows(prev => {
-              const c = [...prev];
-              c[globalIdx] = {
-                ...c[globalIdx],
-                domain,
-                status: "complete",
-                timeMs: res.timeMs,
-                closestUrl: res.closestUrl,
-                closestTs: res.closestTs,
-                ...enrichInfo
-              };
-              return c;
-            });
-          } catch (e) {
-            errors += 1;
-            setRows(prev => {
-              const c = [...prev];
-              c[globalIdx] = { ...c[globalIdx], domain, status: "error", timeMs: 0, closestUrl: null, closestTs: null };
-              return c;
-            });
-          } finally {
-            done += 1;
-            setStats({ done, total: domains.length, errors, avg: Math.round(totalTime / Math.max(1, (done - errors))) });
+            enrichInfo = await enrichByCDX(domain);
+            await new Promise(r => setTimeout(r, 150));
+          } catch (err) {
+            console.error("enrichByCDX failed for", domain, err);
           }
-        })
-      );
+          setRows(prev => {
+            const c = [...prev];
+            c[globalIdx] = { ...c[globalIdx], ...enrichInfo };
+            return c;
+          });
 
+          totalTime += res.timeMs;
+        } catch (e) {
+          errors += 1;
+          setRows(prev => {
+            const c = [...prev];
+            c[globalIdx] = { ...c[globalIdx], domain, status: "error", timeMs: 0, closestUrl: null, closestTs: null };
+            return c;
+          });
+        } finally {
+          done += 1;
+          setStats({ done, total: domains.length, errors, avg: Math.round(totalTime / Math.max(1, (done - errors))) });
+        }
+      }
       if (controller.signal.aborted) break;
     }
 
@@ -193,7 +197,6 @@ export default function App() {
     a.click();
   };
 
-  // Enrich từng dòng (CDX)
   const enrichOne = async (idx) => {
     const r = rows[idx];
     if (!r || r.status !== "complete") return;
@@ -209,11 +212,9 @@ export default function App() {
     }
   };
 
-  // Enrich tất cả (an toàn: chạy tuần tự)
   const enrichAllSafe = async () => {
     for (let i = 0; i < rows.length; i++) {
       if (rows[i]?.status === "complete") {
-        // tránh block: delay nhỏ
         await enrichOne(i);
         await new Promise(r => setTimeout(r, 150));
       }
