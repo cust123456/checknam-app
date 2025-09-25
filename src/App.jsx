@@ -392,7 +392,7 @@ export default function App() {
         )}
 
         <div className="text-xs text-neutral-500 pt-6">
-          GENO TOOL · Xây dựng bằng React · Tailwind · Framer Motion · Sử dụng Wayback Available + CDX APIs
+          GENO TOOL Bản Quyền thuộc về GENO Ở KJC
         </div>
       </div>
     </div>
