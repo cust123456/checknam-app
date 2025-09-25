@@ -37,7 +37,7 @@ async function checkAvailable(domain) {
     res = await fetch(endpoint, { cache: "no-store" });
     data = await res.json();
   } catch (e) {
-    throw new Error("Network error");
+    throw new Error("Lỗi mạng");
   }
   const t1 = performance.now();
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -76,7 +76,7 @@ async function enrichByCDX(domain) {
 
   if (firstYear !== "—" && lastYear !== "—") {
     const span = Number(lastYear) - Number(firstYear);
-    years = `${span} years`;
+    years = `${span} năm`;
   }
 
   const yearRes = await fetchProxy("year");
@@ -103,7 +103,7 @@ async function checkDomainTwice(domain, delayMs = 2500) {
       if (attempt === 2) {
         return {
           status: "error",
-          errorMsg: e?.message || "Unknown error",
+          errorMsg: e?.message || "Lỗi không xác định",
           years: "—",
           firstYear: "—",
           lastYear: "—",
@@ -118,7 +118,7 @@ async function checkDomainTwice(domain, delayMs = 2500) {
   }
   return {
     status: "error",
-    errorMsg: "Unknown error",
+    errorMsg: "Lỗi không xác định",
     years: "—",
     firstYear: "—",
     lastYear: "—",
@@ -224,7 +224,7 @@ export default function App() {
     const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `archive-results-${Date.now()}.csv`;
+    a.download = `archive-ketqua-${Date.now()}.csv`;
     a.click();
   };
 
@@ -241,7 +241,7 @@ export default function App() {
             className="inline-flex items-center gap-2 bg-[#D19B00] hover:bg-[#B88700] text-white px-5 py-3 rounded-md text-base font-medium disabled:opacity-60"
           >
             <Zap className="w-5 h-5" />
-            {isScanning ? "High-Speed Scanning..." : "High-Speed Scan"}
+            {isScanning ? "Đang Quét Nhanh..." : "Quét Nhanh"}
           </button>
           <div className="flex gap-3">
             <button
@@ -258,14 +258,14 @@ export default function App() {
               className="inline-flex items-center justify-center border border-gray-200 bg-white hover:bg-gray-50 h-10 px-4 rounded-md text-sm"
             >
               <Upload className="mr-2 h-4 w-4" />
-              Load Sample Domains
+              Tải Miền Mẫu
             </button>
             <button
               onClick={exportCSV}
               className="inline-flex items-center justify-center border border-gray-200 bg-white hover:bg-gray-50 h-10 px-4 rounded-md text-sm"
             >
               <Download className="mr-2 h-4 w-4" />
-              Export Results
+              Xuất Kết Quả
             </button>
           </div>
         </div>
@@ -275,21 +275,21 @@ export default function App() {
             <div className="flex items-center gap-2 text-sm">
               <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
               <span className="font-medium">
-                Processing batch {batchInfo.idx} of {batchInfo.total}
+                Đang xử lý batch {batchInfo.idx} / {batchInfo.total}
               </span>
             </div>
             <div className="h-2 bg-gray-200 rounded-full overflow-hidden mt-3">
               <div className="h-full bg-black" style={{ width: `${pct}%` }} />
             </div>
             <div className="text-xs text-gray-600 mt-2">
-              10 domains per batch • Each domain checked twice • Batch runs sequentially
+              10 miền mỗi lần quét • Mỗi miền quét 2 lần • Quét tuần tự từng batch
             </div>
             <div className="mt-2 text-sm flex items-center gap-4">
-              <span className="text-emerald-600">✓ Completed: {stats.done - stats.errors}</span>
-              <span className="text-red-600">✗ Errors: {stats.errors}</span>
-              <span className="text-blue-700">⏱ Avg: {isFinite(stats.avg) ? stats.avg : 0}ms</span>
+              <span className="text-emerald-600">✓ Đã hoàn thành: {stats.done - stats.errors}</span>
+              <span className="text-red-600">✗ Lỗi: {stats.errors}</span>
+              <span className="text-blue-700">⏱ TB: {isFinite(stats.avg) ? stats.avg : 0}ms</span>
               <button onClick={cancelScan} className="ml-auto inline-flex items-center gap-1 px-3 py-1.5 bg-red-50 text-red-700 border border-red-200 rounded">
-                <X className="h-4 w-4" /> Cancel Scan
+                <X className="h-4 w-4" /> Hủy Quét
               </button>
             </div>
           </div>
@@ -298,12 +298,12 @@ export default function App() {
         <div className="bg-white border rounded-lg p-4 mb-4">
           <textarea
             className="w-full min-h-[160px] rounded-md border border-gray-200 p-3 font-mono text-sm outline-none focus:ring-2 focus:ring-blue-500"
-            placeholder="Paste anything — we auto-extract valid domains (1 per line, comma or spaces are OK)"
+            placeholder="Dán bất cứ nội dung nào — hệ thống tự động tách miền hợp lệ (1 dòng, dấu phẩy hoặc cách đều được)"
             value={raw}
             onChange={(e) => setRaw(e.target.value)}
           />
           <div className="text-xs text-gray-500 mt-2">
-            Parsed domains: <b>{parsedCount}</b> (max 1000)
+            Số miền đã tách: <b>{parsedCount}</b> (tối đa 1000)
           </div>
           {stats.total > 0 && (
             <div className="mt-3">
@@ -320,20 +320,20 @@ export default function App() {
         {rows.length > 0 && (
           <div className="bg-white border rounded-lg">
             <div className="px-4 py-3 text-base font-semibold border-b flex items-center justify-between">
-              <span>Scan Results ({rows.length} domains)</span>
+              <span>Kết Quả Quét ({rows.length} miền)</span>
             </div>
             <div className="overflow-auto">
               <table className="min-w-full text-sm">
                 <thead className="bg-gray-50 text-gray-700">
                   <tr>
-                    <th className="text-left px-4 py-2">Domain</th>
-                    <th className="text-left px-4 py-2">Status</th>
-                    <th className="text-left px-4 py-2">Years</th>
-                    <th className="text-left px-4 py-2">First Year</th>
-                    <th className="text-left px-4 py-2">Last Year</th>
-                    <th className="text-left px-4 py-2">Total Snapshots</th>
-                    <th className="text-left px-4 py-2">Time (ms)</th>
-                    <th className="text-left px-4 py-2">Actions</th>
+                    <th className="text-left px-4 py-2">Miền</th>
+                    <th className="text-left px-4 py-2">Trạng thái</th>
+                    <th className="text-left px-4 py-2">Số năm</th>
+                    <th className="text-left px-4 py-2">Năm đầu</th>
+                    <th className="text-left px-4 py-2">Năm cuối</th>
+                    <th className="text-left px-4 py-2">Tổng bản lưu</th>
+                    <th className="text-left px-4 py-2">Thời gian (ms)</th>
+                    <th className="text-left px-4 py-2">Hành động</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y">
@@ -344,18 +344,18 @@ export default function App() {
                         <td className="px-4 py-2">
                           {r.status === "checking" && (
                             <span className="inline-flex items-center gap-1 text-gray-600">
-                              <Loader2 className="animate-spin" size={16}/> Checking
+                              <Loader2 className="animate-spin" size={16}/> Đang kiểm tra
                             </span>
                           )}
                           {r.status === "error" && (
                             <span className="inline-flex items-center gap-1 text-red-600">
-                              <AlertCircle size={16}/> Error
+                              <AlertCircle size={16}/> Lỗi
                               {r.errorMsg ? <span className="ml-2 text-xs">{r.errorMsg}</span> : null}
                             </span>
                           )}
                           {r.status === "complete" && (
                             <span className="inline-flex items-center gap-1 text-emerald-700">
-                              <CheckCircle2 size={16}/> Complete
+                              <CheckCircle2 size={16}/> Hoàn thành
                             </span>
                           )}
                         </td>
@@ -375,10 +375,10 @@ export default function App() {
                             {r.closestUrl ? (
                               <a className="inline-flex items-center gap-1 px-3 py-1.5 border rounded-md hover:bg-gray-50"
                                  href={r.closestUrl} target="_blank" rel="noreferrer">
-                                <ExternalLink size={14}/> Archive
+                                <ExternalLink size={14}/> Lưu trữ
                               </a>
                             ) : (
-                              <span className="text-gray-400 px-3 py-1.5 border rounded-md">Archive</span>
+                              <span className="text-gray-400 px-3 py-1.5 border rounded-md">Lưu trữ</span>
                             )}
                           </div>
                         </td>
@@ -392,7 +392,7 @@ export default function App() {
         )}
 
         <div className="text-xs text-neutral-500 pt-6">
-          Built with React · Tailwind · Framer Motion · Uses Wayback Available + CDX APIs
+          GENO TOOL · Xây dựng bằng React · Tailwind · Framer Motion · Sử dụng Wayback Available + CDX APIs
         </div>
       </div>
     </div>
