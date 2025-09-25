@@ -1,7 +1,7 @@
 import React, { useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Zap, Download, Loader2, Upload, X, CheckCircle2, AlertCircle, ExternalLink
+  Zap, Download, Loader2, Upload, X, CheckCircle2, AlertCircle, ExternalLink, Copy
 } from "lucide-react";
 
 // Lọc domain hợp lệ
@@ -80,7 +80,12 @@ async function enrichByCDX(domain) {
   }
 
   const yearRes = await fetchProxy("year");
-  totalSnapshots = Math.max(0, (Array.isArray(yearRes) ? yearRes.length - 1 : 0));
+  // Sửa cho trường hợp dữ liệu trả về là mảng 2 chiều hoặc object
+  totalSnapshots = Array.isArray(yearRes)
+    ? Math.max(0, yearRes.length - 1)
+    : typeof yearRes === "object" && yearRes !== null
+      ? Math.max(0, Object.keys(yearRes).length - 1)
+      : 0;
 
   return { firstYear, lastYear, years, totalSnapshots };
 }
@@ -228,6 +233,15 @@ export default function App() {
     a.click();
   };
 
+  // Nút copy domain có năm và cả năm
+  const copyDomainsWithYears = () => {
+    const lines = rows
+      .filter(r => typeof r.years === "string" && r.years !== "—" && !r.years.startsWith("0"))
+      .map(r => `${r.domain}, ${r.years}, ${r.firstYear}, ${r.lastYear}`);
+    if (lines.length === 0) return;
+    navigator.clipboard.writeText(lines.join("\n"));
+  };
+
   const parsedCount = domains.length;
   const pct = stats.total ? Math.round((stats.done / stats.total) * 100) : 0;
 
@@ -266,6 +280,13 @@ export default function App() {
             >
               <Download className="mr-2 h-4 w-4" />
               Xuất Kết Quả
+            </button>
+            <button
+              onClick={copyDomainsWithYears}
+              className="inline-flex items-center justify-center border border-gray-200 bg-white hover:bg-gray-50 h-10 px-4 rounded-md text-sm"
+            >
+              <Copy className="mr-2 h-4 w-4" />
+              Coppy domain & năm
             </button>
           </div>
         </div>
