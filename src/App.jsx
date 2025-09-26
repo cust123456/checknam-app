@@ -50,16 +50,25 @@ async function checkAvailable(domain) {
   };
 }
 
+// Hàm nâng cấp - retry nhiều lần, check đa dạng kiểu dữ liệu trả về, log lỗi rõ ràng
 async function enrichByCDX(domain) {
   const fetchProxy = async (type) => {
     const url = `/api/cdx?url=${encodeURIComponent(domain)}&type=${type}`;
-    try {
-      const res = await fetch(url);
-      if (!res.ok) return null;
-      return await res.json();
-    } catch {
-      return null;
+    for (let i = 0; i < 3; i++) { // thử tối đa 3 lần
+      try {
+        const res = await fetch(url);
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (data && ((Array.isArray(data) && data.length > 1) || (typeof data === "object" && Object.keys(data).length > 0))) {
+          return data;
+        }
+      } catch (err) {
+        // Có thể dùng Sentry, hoặc log ra console
+        console.warn(`CDX API lỗi cho ${domain} (${type}):`, err);
+      }
+      await new Promise(r => setTimeout(r, 1000)); // đợi 1s giữa các lần thử
     }
+    return null;
   };
 
   let firstYear = "—", lastYear = "—", years = "—", totalSnapshots = 0;
@@ -67,11 +76,15 @@ async function enrichByCDX(domain) {
   const firstRes = await fetchProxy("first");
   if (Array.isArray(firstRes) && firstRes.length > 1 && firstRes[1][0]) {
     firstYear = firstRes[1][0].slice(0, 4);
+  } else if (firstRes && firstRes.timestamp) {
+    firstYear = firstRes.timestamp.slice(0, 4);
   }
 
   const lastRes = await fetchProxy("last");
   if (Array.isArray(lastRes) && lastRes.length > 1 && lastRes[1][0]) {
     lastYear = lastRes[1][0].slice(0, 4);
+  } else if (lastRes && lastRes.timestamp) {
+    lastYear = lastRes.timestamp.slice(0, 4);
   }
 
   if (firstYear !== "—" && lastYear !== "—") {
@@ -80,58 +93,106 @@ async function enrichByCDX(domain) {
   }
 
   const yearRes = await fetchProxy("year");
-  // Sửa cho trường hợp dữ liệu trả về là mảng 2 chiều hoặc object
   totalSnapshots = Array.isArray(yearRes)
     ? Math.max(0, yearRes.length - 1)
     : typeof yearRes === "object" && yearRes !== null
       ? Math.max(0, Object.keys(yearRes).length - 1)
       : 0;
 
+  // Nếu vẫn chưa có dữ liệu, thử fetch trực tiếp từ Wayback API làm fallback
+  if (totalSnapshots === 0) {
+    // Có thể bổ sung logic fetch trực tiếp từ archive.org hoặc lưu log miền lỗi
+  }
+
   return { firstYear, lastYear, years, totalSnapshots };
 }
 
-// Thử 2 lần cho 1 domain, lấy kết quả đầu tiên hợp lệ, trả về error nếu cả 2 lần đều fail
-async function checkDomainTwice(domain, delayMs = 2500) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const res = await checkAvailable(domain);
-      if (res.archived) {
-        let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
+// Hàm quét song song
+async function scanDomainsParallel(domains, setRows, setStats, setBatchInfo, abortRef, batchSize, delayBetweenAttempts, delayBetweenBatch) {
+  setRows(domains.map(d => ({
+    domain: d, status: "checking", years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0
+  })));
+  setStats({ done: 0, total: domains.length, errors: 0, avg: 0 });
+
+  const controller = new AbortController();
+  abortRef.current = controller;
+
+  const batches = chunk(domains, batchSize);
+  setBatchInfo({ idx: 1, total: batches.length });
+
+  let done = 0;
+  let errors = 0;
+  let totalTime = 0;
+
+  for (let b = 0; b < batches.length; b++) {
+    setBatchInfo({ idx: b + 1, total: batches.length });
+    const batch = batches[b];
+
+    // Quét song song trong batch
+    const promises = batch.map(async (domain, j) => {
+      if (controller.signal.aborted) return;
+      const globalIdx = b * batchSize + j;
+      setRows(prev => {
+        const c = [...prev];
+        c[globalIdx] = { ...c[globalIdx], status: "checking", errorMsg: undefined };
+        return c;
+      });
+      const t0 = performance.now();
+      let result;
+      for (let retry = 0; retry < 2; retry++) {
         try {
-          enrichInfo = await enrichByCDX(domain);
-        } catch {}
-        return { ...res, ...enrichInfo, status: "complete" };
+          // Quét available và enrich
+          const res = await checkAvailable(domain);
+          if (res.archived) {
+            let enrichInfo = { years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0 };
+            try {
+              enrichInfo = await enrichByCDX(domain);
+            } catch (err) {
+              console.warn(`Lỗi enrich cho ${domain}:`, err);
+            }
+            result = { ...res, ...enrichInfo, status: "complete" };
+            break; // thành công, break retry
+          } else {
+            result = { ...res, years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0, status: "complete" };
+            break;
+          }
+        } catch (e) {
+          if (retry === 1) {
+            result = {
+              status: "error",
+              errorMsg: e?.message || "Lỗi không xác định",
+              years: "—",
+              firstYear: "—",
+              lastYear: "—",
+              totalSnapshots: 0,
+              timeMs: 0,
+              closestUrl: null,
+              closestTs: null
+            };
+          }
+          await new Promise(r => setTimeout(r, delayBetweenAttempts));
+        }
       }
-      // Nếu không có archived, vẫn trả về complete với snapshot rỗng
-      return { ...res, years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0, status: "complete" };
-    } catch (e) {
-      if (attempt === 2) {
-        return {
-          status: "error",
-          errorMsg: e?.message || "Lỗi không xác định",
-          years: "—",
-          firstYear: "—",
-          lastYear: "—",
-          totalSnapshots: 0,
-          timeMs: 0,
-          closestUrl: null,
-          closestTs: null
+      const t1 = performance.now();
+      setRows(prev => {
+        const c = [...prev];
+        c[globalIdx] = {
+          ...c[globalIdx],
+          ...result,
+          timeMs: result.status === "error" ? 0 : Math.max(1, Math.round(t1 - t0))
         };
-      }
-    }
-    if (attempt === 1) await new Promise(r => setTimeout(r, delayMs));
+        return c;
+      });
+      done += 1;
+      if (result.status === "error") errors += 1;
+      else totalTime += (result.timeMs || 0);
+      setStats({ done, total: domains.length, errors, avg: Math.round(totalTime / Math.max(1, (done - errors))) });
+    });
+
+    await Promise.allSettled(promises);
+    if (controller.signal.aborted) break;
+    if (b < batches.length - 1) await new Promise(r => setTimeout(r, delayBetweenBatch));
   }
-  return {
-    status: "error",
-    errorMsg: "Lỗi không xác định",
-    years: "—",
-    firstYear: "—",
-    lastYear: "—",
-    totalSnapshots: 0,
-    timeMs: 0,
-    closestUrl: null,
-    closestTs: null
-  };
 }
 
 export default function App() {
@@ -149,58 +210,11 @@ export default function App() {
   const DELAY_BETWEEN_ATTEMPTS = 2500; // 2.5s chờ giữa 2 lần quét 1 domain
   const DELAY_BETWEEN_BATCH = 2500; // 2.5s chờ giữa các batch
 
-  // Chạy từng batch, từng domain quét 2 lần, tuần tự batch
+  // Nâng cấp: quét song song
   const startScan = async () => {
     if (domains.length === 0) return;
     setIsScanning(true);
-    setRows(domains.map(d => ({
-      domain: d, status: "checking", years: "—", firstYear: "—", lastYear: "—", totalSnapshots: 0
-    })));
-    setStats({ done: 0, total: domains.length, errors: 0, avg: 0 });
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    const batches = chunk(domains, BATCH_SIZE);
-    setBatchInfo({ idx: 1, total: batches.length });
-
-    let done = 0;
-    let errors = 0;
-    let totalTime = 0;
-
-    for (let b = 0; b < batches.length; b++) {
-      setBatchInfo({ idx: b + 1, total: batches.length });
-      const batch = batches[b];
-      for (let j = 0; j < batch.length; j++) {
-        if (controller.signal.aborted) continue;
-        const domain = batch[j];
-        const globalIdx = b * BATCH_SIZE + j;
-        setRows(prev => {
-          const c = [...prev];
-          c[globalIdx] = { ...c[globalIdx], status: "checking", errorMsg: undefined };
-          return c;
-        });
-        const t0 = performance.now();
-        const result = await checkDomainTwice(domain, DELAY_BETWEEN_ATTEMPTS);
-        const t1 = performance.now();
-        setRows(prev => {
-          const c = [...prev];
-          c[globalIdx] = {
-            ...c[globalIdx],
-            ...result,
-            timeMs: result.status === "error" ? 0 : Math.max(1, Math.round(t1 - t0))
-          };
-          return c;
-        });
-        done += 1;
-        if (result.status === "error") errors += 1;
-        else totalTime += (result.timeMs || 0);
-        setStats({ done, total: domains.length, errors, avg: Math.round(totalTime / Math.max(1, (done - errors))) });
-      }
-      if (controller.signal.aborted) break;
-      if (b < batches.length - 1) await new Promise(r => setTimeout(r, DELAY_BETWEEN_BATCH));
-    }
-
+    await scanDomainsParallel(domains, setRows, setStats, setBatchInfo, abortRef, BATCH_SIZE, DELAY_BETWEEN_ATTEMPTS, DELAY_BETWEEN_BATCH);
     setIsScanning(false);
   };
 
@@ -233,7 +247,6 @@ export default function App() {
     a.click();
   };
 
-  // Nút copy domain có năm và cả năm
   const copyDomainsWithYears = () => {
     const lines = rows
       .filter(r => typeof r.years === "string" && r.years !== "—" && !r.years.startsWith("0"))
@@ -244,6 +257,8 @@ export default function App() {
 
   const parsedCount = domains.length;
   const pct = stats.total ? Math.round((stats.done / stats.total) * 100) : 0;
+
+  const errorRows = rows.filter(r => r.status === "error");
 
   return (
     <div className="min-h-screen bg-[#EEF2FF]">
@@ -303,7 +318,7 @@ export default function App() {
               <div className="h-full bg-black" style={{ width: `${pct}%` }} />
             </div>
             <div className="text-xs text-gray-600 mt-2">
-              10 miền mỗi lần quét • Mỗi miền quét 2 lần • Quét tuần tự từng batch
+              10 miền mỗi lần quét • Mỗi miền quét 2 lần • Quét tuần tự từng batch (song song trong batch)
             </div>
             <div className="mt-2 text-sm flex items-center gap-4">
               <span className="text-emerald-600">✓ Đã hoàn thành: {stats.done - stats.errors}</span>
@@ -409,6 +424,11 @@ export default function App() {
                 </tbody>
               </table>
             </div>
+            {errorRows.length > 0 && (
+              <div className="mt-3 text-xs text-red-600">
+                <b>Miền lỗi không lấy được dữ liệu:</b> {errorRows.map(r=>r.domain).join(", ")}
+              </div>
+            )}
           </div>
         )}
 
